@@ -24,7 +24,7 @@ set -o pipefail
 #  Toolkit 版本(每次 commit 自动 +1,见 .githooks/pre-commit)
 # ============================================================
 
-readonly TOOLKIT_VERSION="1.1.5"
+readonly TOOLKIT_VERSION="1.1.6"
 
 # ============================================================
 #  配置(可通过环境变量 / 配置文件覆盖)
@@ -686,6 +686,8 @@ step_force_revert() {
         ok "没有任何文件被 checkout — 无需解锁"; return 0
     fi
     echo "$opened" | sed 's/^/    /'
+    local total; total="$(echo "$opened" | grep -c . || true)"
+    info "共 $total 个文件被 checkout"
     echo
 
     # 2. 选择解锁范围
@@ -715,49 +717,82 @@ step_force_revert() {
         *) info "已取消"; return 0 ;;
     esac
 
-    # 3. 确认 + 执行
-    warn "revert 会丢弃这些文件的未提交改动(电脑已格式化,本来也找不回)"
-    confirm "确认强制 revert?" || { info "已取消"; return 0; }
+    # 3. 预览:列出本次将要 revert 的文件清单 + 数量
+    #    从已抓取的 opened -a 文本里按 模式 过滤(行尾形如  ... by user@client)
+    local preview
+    case "$mode" in
+        a) preview="$(echo "$opened" | awk -v c="$client" '
+               { n=split($0,a," "); split(a[n],b,"@"); if (b[2]==c) print }')" ;;
+        b) preview="$(echo "$opened" | awk -v u="$user" '
+               { n=split($0,a," "); split(a[n],b,"@"); if (b[1]==u) print }')" ;;
+        c) preview="$(echo "$opened" | grep -F "$filespec" || true)" ;;
+    esac
 
+    if [[ -z "$preview" ]]; then
+        case "$mode" in
+            a) warn "workspace '$client' 名下没有 checkout(检查 client 名是否正确)" ;;
+            b) warn "用户 '$user' 名下没有 checkout(检查用户名是否正确)" ;;
+            c) warn "没找到文件 '$filespec' 的 checkout(检查路径是否正确)" ;;
+        esac
+        return 0
+    fi
+
+    local will_count; will_count="$(echo "$preview" | grep -c . || true)"
+    echo
+    info "[2] 即将 revert 的文件清单(共 $will_count 个):"
+    echo "$preview" | sed 's/^/    /'
+    echo
+
+    # 4. 确认 + 执行(捕获 revert 输出统计实际 revert 数量)
+    warn "revert 会丢弃这些文件的未提交改动(电脑已格式化,本来也找不回)"
+    confirm "确认强制 revert 上面 $will_count 个文件?" || { info "已取消"; return 0; }
+
+    local revert_out="" reverted=0
     if [[ "$mode" == "b" ]]; then
-        # revert 没有 -u 选项,只能按 client。从 opened -a 提取该用户的全部 client。
-        # 行尾形如:  ... by user@client
-        local clients
-        clients="$(echo "$opened" | awk -v u="$user" '
-            { n=split($0,a," "); split(a[n],b,"@");
-              if (b[1]==u && b[2]!="") print b[2] }' | sort -u)"
-        if [[ -z "$clients" ]]; then
-            warn "没找到用户 $user 的 checkout"; return 0
-        fi
-        local c
+        # revert 没有 -u 选项,只能按 client。从 preview 提取该用户的全部 client。
+        local clients c out
+        clients="$(echo "$preview" | awk '
+            { n=split($0,a," "); split(a[n],b,"@"); if (b[2]!="") print b[2] }' | sort -u)"
         for c in $clients; do
             info "revert client=$c 上 $user 的文件..."
-            if ! "$P4_BIN" -p "localhost:$P4PORT" -u admin revert -C "$c" //... ; then
+            if out="$("$P4_BIN" -p "localhost:$P4PORT" -u admin revert -C "$c" //... 2>&1)"; then
+                echo "$out" | sed 's/^/      /'
+                revert_out+="$out"$'\n'
+            else
+                echo "$out" | sed 's/^/      /'
                 warn "  client $c revert 出错(若提示 client unknown,见下方说明)"
             fi
         done
     else
         info "revert -C $client $filespec ..."
-        if ! "$P4_BIN" -p "localhost:$P4PORT" -u admin revert -C "$client" "$filespec"; then
+        if revert_out="$("$P4_BIN" -p "localhost:$P4PORT" -u admin revert -C "$client" "$filespec" 2>&1)"; then
+            echo "$revert_out" | sed 's/^/      /'
+        else
+            echo "$revert_out" | sed 's/^/      /'
             err "revert 失败"
             warn "若提示 'Client $client unknown' —— workspace 已被删除。"
-            warn "解决:临时重建同名 client 再 revert:"
-            warn "    p4 -p localhost:$P4PORT -u admin client -i <<< \"Client: $client\nRoot: /tmp/$client\nView: //depot/... //$client/...\""
+            warn "解决:临时重建同名 client 再 revert,例如:"
+            warn "    p4 -p localhost:$P4PORT -u admin client -i <<< \$'\''Client: '"$client"'\nRoot: /tmp/'"$client"'\nView:\n\t//depot/... //'"$client"'/...'\''"
             warn "    再回到本菜单选 a) 用同名 client revert。"
             return 1
         fi
     fi
 
-    # 4. 验证
+    # revert 成功的行形如:  //depot/... - was edit, reverted
+    reverted="$(echo "$revert_out" | grep -c 'reverted' || true)"
+
+    # 5. 验证 + 汇总
     echo
-    info "[验证] 剩余 opened 文件:"
+    ok "本次共 revert $reverted 个文件"
+    info "[3] 验证 — 剩余 opened 文件:"
     local after
     after="$("$P4_BIN" -p "localhost:$P4PORT" -u admin opened -a 2>/dev/null || true)"
     if [[ -z "$after" ]]; then
         ok "全部已释放,没有残留 checkout"
     else
         echo "$after" | sed 's/^/    /'
-        info "(以上为其他仍在使用的 checkout,未动)"
+        local left; left="$(echo "$after" | grep -c . || true)"
+        info "仍有 $left 个其他 checkout(未动)"
     fi
 }
 
