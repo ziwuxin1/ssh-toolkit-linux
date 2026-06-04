@@ -24,7 +24,7 @@ set -o pipefail
 #  Toolkit 版本(每次 commit 自动 +1,见 .githooks/pre-commit)
 # ============================================================
 
-readonly TOOLKIT_VERSION="1.1.4"
+readonly TOOLKIT_VERSION="1.1.5"
 
 # ============================================================
 #  配置(可通过环境变量 / 配置文件覆盖)
@@ -650,6 +650,117 @@ step_counter_rescue() {
     fi
 }
 
+# ============================================================
+#  强制解锁学生遗留 checkout
+# ============================================================
+# 场景:学生电脑被格式化 / workspace 被删,文件还 opened(checkout)挂在
+# 服务器上,别人没法编辑。管理员在服务器本机以 admin 身份强制 revert 释放
+# (含 +l 独占锁)。锁信息存在服务器,跟那台电脑是否还在无关。
+
+_admin_login() {
+    # 用 admin 密码文件登录,ticket 写到固定文件;成功返回 0。
+    [[ -f "$P4D_ADMIN_PASSWD_FILE" ]] || { warn "没有 admin 密码文件 $P4D_ADMIN_PASSWD_FILE"; return 1; }
+    export P4TICKETS=/tmp/.p4tickets_admin
+    "$P4_BIN" -p "localhost:$P4PORT" -u admin login < "$P4D_ADMIN_PASSWD_FILE" >/dev/null 2>&1
+}
+
+step_force_revert() {
+    section "强制解锁学生遗留 checkout"
+    info "用于:学生电脑被格式化 / workspace 已删,文件还 checkout 在服务器上"
+    info "管理员在本机以 admin 身份强制 revert,释放锁(含 +l 独占锁)"
+    echo
+
+    if [[ "$(svc_state)" != "running" ]]; then
+        err "服务未运行,无法操作。先启动服务(菜单 15)"; return 1
+    fi
+    if ! _admin_login; then
+        err "admin 登录失败,无法继续"; return 1
+    fi
+    export P4TICKETS=/tmp/.p4tickets_admin
+
+    # 1. 列出当前所有 opened(checkout)文件
+    info "[1] 当前所有 checkout(opened)文件:"
+    local opened
+    opened="$("$P4_BIN" -p "localhost:$P4PORT" -u admin opened -a 2>/dev/null || true)"
+    if [[ -z "$opened" ]]; then
+        ok "没有任何文件被 checkout — 无需解锁"; return 0
+    fi
+    echo "$opened" | sed 's/^/    /'
+    echo
+
+    # 2. 选择解锁范围
+    info "解锁方式:"
+    echo "    a) 按 workspace(client)整体 revert —— 推荐(电脑格式化场景)"
+    echo "    b) 按用户 revert 该用户所有 checkout(自动跨其全部 client)"
+    echo "    c) 单个文件 revert"
+    echo "    q) 取消"
+    local mode; read -r -p "$(printf "${C_CYAN}选择 [a/b/c/q]: ${C_RESET}")" mode
+
+    local client="" user="" filespec="//..."
+    case "$mode" in
+        a)
+            read -r -p "输入 workspace(client)名: " client
+            [[ -z "$client" ]] && { warn "未输入,取消"; return 0; }
+            ;;
+        b)
+            read -r -p "输入用户名: " user
+            [[ -z "$user" ]] && { warn "未输入,取消"; return 0; }
+            ;;
+        c)
+            read -r -p "输入 depot 文件路径(如 //depot/x/a.txt): " filespec
+            [[ -z "$filespec" ]] && { warn "未输入,取消"; return 0; }
+            read -r -p "该文件所属 workspace(client)名: " client
+            [[ -z "$client" ]] && { warn "未输入,取消"; return 0; }
+            ;;
+        *) info "已取消"; return 0 ;;
+    esac
+
+    # 3. 确认 + 执行
+    warn "revert 会丢弃这些文件的未提交改动(电脑已格式化,本来也找不回)"
+    confirm "确认强制 revert?" || { info "已取消"; return 0; }
+
+    if [[ "$mode" == "b" ]]; then
+        # revert 没有 -u 选项,只能按 client。从 opened -a 提取该用户的全部 client。
+        # 行尾形如:  ... by user@client
+        local clients
+        clients="$(echo "$opened" | awk -v u="$user" '
+            { n=split($0,a," "); split(a[n],b,"@");
+              if (b[1]==u && b[2]!="") print b[2] }' | sort -u)"
+        if [[ -z "$clients" ]]; then
+            warn "没找到用户 $user 的 checkout"; return 0
+        fi
+        local c
+        for c in $clients; do
+            info "revert client=$c 上 $user 的文件..."
+            if ! "$P4_BIN" -p "localhost:$P4PORT" -u admin revert -C "$c" //... ; then
+                warn "  client $c revert 出错(若提示 client unknown,见下方说明)"
+            fi
+        done
+    else
+        info "revert -C $client $filespec ..."
+        if ! "$P4_BIN" -p "localhost:$P4PORT" -u admin revert -C "$client" "$filespec"; then
+            err "revert 失败"
+            warn "若提示 'Client $client unknown' —— workspace 已被删除。"
+            warn "解决:临时重建同名 client 再 revert:"
+            warn "    p4 -p localhost:$P4PORT -u admin client -i <<< \"Client: $client\nRoot: /tmp/$client\nView: //depot/... //$client/...\""
+            warn "    再回到本菜单选 a) 用同名 client revert。"
+            return 1
+        fi
+    fi
+
+    # 4. 验证
+    echo
+    info "[验证] 剩余 opened 文件:"
+    local after
+    after="$("$P4_BIN" -p "localhost:$P4PORT" -u admin opened -a 2>/dev/null || true)"
+    if [[ -z "$after" ]]; then
+        ok "全部已释放,没有残留 checkout"
+    else
+        echo "$after" | sed 's/^/    /'
+        info "(以上为其他仍在使用的 checkout,未动)"
+    fi
+}
+
 step_one_click_restore() {
     section "🚀 一键恢复"
     # 优先从 Root_Temp 找(全新部署 / 迁移场景),没有则用 BACKUP_DIR(日常 cron 输出)
@@ -1137,6 +1248,7 @@ main_menu() {
   ${C_BOLD}── 救援 ──${C_RESET}
   6) Counter 救援 (license 炸了用)
   7) 一键恢复 (从备份 checkpoint+journal)
+  8) 强制解锁学生遗留 checkout (电脑格式化 / workspace 没了)
 
   ${C_BOLD}── 体检 / 状态 ──${C_RESET}
   10) 健康体检
@@ -1168,6 +1280,7 @@ MENU
             5)  step_prepare_workspace && step_install_p4d && step_install_license && step_setup_systemd_with_rescue && step_setup_cron_checkpoint ;;
             6)  step_counter_rescue ;;
             7)  step_one_click_restore ;;
+            8)  step_force_revert ;;
             10) step_health_check ;;
             11) step_show_backup_status ;;
             12) step_view_journal ;;
@@ -1202,7 +1315,8 @@ main() {
             rsync)           step_run_rsync_now ;;
             counter-rescue)  step_counter_rescue ;;
             restore)         step_one_click_restore ;;
-            *) die "未知子命令: $1 (用法: status|checkpoint|rsync|counter-rescue|restore)" ;;
+            force-revert)    step_force_revert ;;
+            *) die "未知子命令: $1 (用法: status|checkpoint|rsync|counter-rescue|restore|force-revert)" ;;
         esac
         exit 0
     fi
